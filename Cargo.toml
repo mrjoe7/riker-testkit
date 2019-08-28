@@ -1,11 +1,14 @@
 [package]
 name = "riker-testkit"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Lee Smith <leenozara@gmail.com>"]
 description = "Tools to make testing Riker applications easier"
 homepage = "http://riker.rs/logging"
 license = "MIT"
 readme = "README.md"
+edition = "2018"
 
 [dependencies]
 chrono = "0.4"
+async-trait = "0.1.11"
+futures-preview = "0.3.0-alpha.18"

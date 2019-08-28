@@ -1,36 +1,40 @@
+use async_trait::async_trait;
 
+#[async_trait]
 pub trait Probe {
     type Msg: Send;
     type Pay: Clone + Send;
     
-    fn event(&self, evt: Self::Msg);
+    async fn event(&mut self, evt: Self::Msg);
     fn payload(&self) -> &Self::Pay;
 }
 
+#[async_trait]
 pub trait ProbeReceive {
     type Msg: Send;
 
-    fn recv(&self) -> Self::Msg;
+    async fn recv(&mut self) -> Self::Msg;
     fn reset_timer(&mut self);
     fn last_event_milliseconds(&self) -> u64;
     fn last_event_seconds(&self) -> u64;
 }
 
-/// The channel module provides an std::sync::mpsc::channel() based Probe
+/// The channel module provides an futures::channel::mpsc::unbounded() based Probe
 /// that is suitable for use in a single, local application.
 /// This Probe cannot be serialized.
 pub mod channel {
-    use super::{Probe, ProbeReceive};
+    use crate::probe::{Probe, ProbeReceive};
 
     use chrono::prelude::*;
-    use std::sync::mpsc::{channel, Sender, Receiver};
+    use async_trait::async_trait;
+    use futures::{channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender}, prelude::*};
 
     pub fn probe<T: Send>() -> (ChannelProbe<(), T>, ChannelProbeReceive<T>) {
         probe_with_payload(())
     }
 
     pub fn probe_with_payload<P: Clone + Send, T: Send>(payload: P) -> (ChannelProbe<P, T>, ChannelProbeReceive<T>) {
-        let (tx, rx) = channel::<T>();
+        let (tx, rx) = unbounded::<T>();
 
         let probe = ChannelProbe {
             payload: Some(payload),
@@ -38,8 +42,8 @@ pub mod channel {
         };
 
         let receiver = ChannelProbeReceive {
-            rx: rx,
-            tx: tx,
+            rx,
+            tx,
             timer_start: Utc::now()
         };
 
@@ -49,16 +53,17 @@ pub mod channel {
     #[derive(Clone, Debug)]
     pub struct ChannelProbe<P, T> {
         payload: Option<P>,
-        tx: Sender<T>,
+        tx: UnboundedSender<T>,
     }
 
+    #[async_trait]
     impl<P, T> Probe for ChannelProbe<P, T> 
         where P: Clone + Send, T: Send {
             type Msg = T;
             type Pay = P;
 
-            fn event(&self, evt: T) {
-                drop(self.tx.send(evt));
+            async fn event(&mut self, evt: T) {
+                drop(self.tx.send(evt).await);
             }
 
             fn payload(&self) -> &P {
@@ -66,13 +71,16 @@ pub mod channel {
             }
     }
 
+    #[async_trait]
     impl<P, T> Probe for Option<ChannelProbe<P, T>>
-        where P: Clone + Send, T: Send {
+        where P: Clone + Send + Sync, T: Send {
             type Msg = T;
             type Pay = P;
 
-            fn event(&self, evt: T) {
-                drop(self.as_ref().unwrap().tx.send(evt));
+            async fn event(&mut self, evt: T) {
+                let probe_option = self.as_mut();
+                let probe = probe_option.unwrap();
+                drop(probe.tx.send(evt).await);
             }
 
             fn payload(&self) -> &P {
@@ -82,16 +90,17 @@ pub mod channel {
 
     #[allow(dead_code)]
     pub struct ChannelProbeReceive<T> {
-        rx: Receiver<T>,
-        tx: Sender<T>,
+        rx: UnboundedReceiver<T>,
+        tx: UnboundedSender<T>,
         timer_start: DateTime<Utc>,
     }
 
+    #[async_trait]
     impl<T: Send> ProbeReceive for ChannelProbeReceive<T> {
         type Msg = T;
 
-        fn recv(&self) -> T {
-            self.rx.recv().unwrap()
+        async fn recv(&mut self) -> T {
+            self.rx.next().await.unwrap()
         }
 
         fn reset_timer(&mut self) {
@@ -112,37 +121,36 @@ pub mod channel {
 
 #[cfg(test)]
 mod tests {
-    use super::{Probe, ProbeReceive};
-    use super::channel::{probe, probe_with_payload};
-    use std::thread;
+    use crate::probe::{Probe, ProbeReceive};
+    use crate::probe::channel::{probe, probe_with_payload};
+    use futures::executor::block_on;
 
     #[test]
     fn chan_probe() {
-        let (probe, listen) = probe();
+        block_on(async {
+            let (mut probe, mut listen) = probe();
 
-        thread::spawn(move || {
-            probe.event("some event");
+            probe.event("some event").await;
+
+            assert_eq!(listen.recv().await, "some event");
         });
-
-        assert_eq!(listen.recv(), "some event");
     }
 
     #[test]
     fn chan_probe_with_payload() {
-        let payload = "test data".to_string();
-        let (probe, listen) = probe_with_payload(payload);
+        block_on(async {
+            let payload = "test data".to_string();
+            let (mut probe, mut listen) = probe_with_payload(payload);
 
-        thread::spawn(move || {
             // only event the expected result if the payload is what we expect
             if probe.payload() == "test data" {
-                probe.event("data received");                
+                probe.event("data received").await;
             } else {
-                probe.event("");            
+                probe.event("").await;
             }
-            
-        });
 
-        assert_eq!(listen.recv(), "data received");
+            assert_eq!(listen.recv().await, "data received");
+        });
     }
 }
 
@@ -154,7 +162,7 @@ pub mod macros {
     #[macro_export]
     macro_rules! p_assert_eq {
         ($listen:expr, $expected:expr) => {
-            assert_eq!($listen.recv(), $expected);
+            assert_eq!($listen.recv().await, $expected);
         };
     }
 
@@ -168,7 +176,8 @@ pub mod macros {
             let mut expected = $expected.clone(); // so we don't need the original mutable
             
             loop {
-                match expected.iter().position(|x| x == &$listen.recv()) {
+                let item = $listen.recv().await;
+                match expected.iter().position(|x| x == &item) {
                     Some(pos) => {
                         expected.remove(pos);
                         if expected.len() == 0 {
@@ -193,36 +202,43 @@ pub mod macros {
 
     #[cfg(test)]
     mod tests {
-        use probe::{Probe, ProbeReceive};
-        use probe::channel::probe;
+        use futures::executor::block_on;
+        use crate::probe::{Probe, ProbeReceive};
+        use crate::probe::channel::probe;
 
         #[test]
         fn p_assert_eq() {
-            let (probe, listen) = probe();
+            block_on(async {
+                let (mut probe, mut listen) = probe();
 
-            probe.event("test".to_string());
-            
-            p_assert_eq!(listen, "test".to_string());
+                probe.event("test".to_string()).await;
+
+                p_assert_eq!(listen, "test".to_string());
+            });
         }
 
         #[test]
         fn p_assert_events() {
-            let (probe, listen) = probe();
+            block_on(async {
+                let (mut probe, mut listen) = probe();
 
-            let expected = vec!["event_1", "event_2", "event_3"];
-            probe.event("event_1");
-            probe.event("event_2");
-            probe.event("event_3");
-            
-            p_assert_events!(listen, expected);
+                let expected = vec!["event_1", "event_2", "event_3"];
+                probe.event("event_1").await;
+                probe.event("event_2").await;
+                probe.event("event_3").await;
+
+                p_assert_events!(listen, expected);
+            });
         }
 
         #[test]
         fn p_timer() {
-            let (probe, listen) = probe();
-            probe.event("event_3");
-            
-            println!("Milliseconds: {}", p_timer!(listen));
+            block_on(async {
+                let (mut probe, listen) = probe();
+                probe.event("event_3").await;
+
+                println!("Milliseconds: {}", p_timer!(listen));
+            });
         }
 
     }
